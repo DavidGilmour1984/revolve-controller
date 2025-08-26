@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Encoder Live Viewer (Web Serial)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{--bg:#0c0f13;--card:#141922;--text:#eaf6ff;--accent:#00e5ff;--ok:#00ff9c;--muted:#9fb3c8}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:auto;padding:20px}
+  .card{background:var(--card);border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.3);padding:18px}
+  h1{margin:0 0 10px 0;font-size:1.4rem;font-weight:700;letter-spacing:.2px}
+  .row{display:flex;gap:18px;flex-wrap:wrap}
+  .col{flex:1 1 320px}
+  button{background:var(--accent);border:none;color:#00222a;padding:10px 14px;border-radius:10px;
+         font-weight:700;cursor:pointer}
+  button.secondary{background:#263041;color:var(--text)}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .kv{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;font-size:1rem}
+  .kv div{padding:6px 8px;background:#0f141c;border-radius:10px}
+  .label{color:var(--muted)}
+  .value{font-weight:700}
+  canvas{width:100%;max-width:360px;height:auto}
+  .status{font-size:.95rem;color:var(--muted);margin-top:8px}
+  .footer{margin-top:12px;font-size:.9rem;color:var(--muted)}
+  .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#0f141c;margin-left:8px}
+  .ok{color:var(--ok)}
+  .warn{color:#ffc857}
+  .err{color:#ff6b6b}
+  .mono{font-family:ui-monospace,SFMono-Regular,Consolas,Monaco,"Liberation Mono","Courier New",monospace}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Encoder Live Viewer <span id="supportBadge" class="badge"></span></h1>
+    <div class="row">
+      <div class="col">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+          <button id="btnConnect">Connect</button>
+          <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
+          <button id="btnInvert" class="secondary">Invert</button>
+        </div>
+
+        <div class="kv">
+          <div class="label">Port</div><div class="value mono" id="portName">—</div>
+          <div class="label">Baud</div><div class="value">115200</div>
+          <div class="label">Count</div><div class="value mono" id="vCount">—</div>
+          <div class="label">Revs</div><div class="value mono" id="vRevs">—</div>
+          <div class="label">Angle (°)</div><div class="value mono" id="vAngle">—</div>
+          <div class="label">Rate</div><div class="value mono" id="vRate">—</div>
+        </div>
+
+        <div class="status" id="status">Idle.</div>
+      </div>
+
+      <div class="col" style="display:flex;align-items:center;justify-content:center">
+        <canvas id="dial" width="400" height="400"></canvas>
+      </div>
+    </div>
+
+    <div class="footer">
+      CSV expected: <span class="mono">count,revs,angle_deg</span>. Lines starting with <span class="mono">#</span> are ignored.
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const support = 'serial' in navigator;
+  const supportBadge = document.getElementById('supportBadge');
+  supportBadge.textContent = support ? 'Web Serial supported' : 'Web Serial not supported';
+  supportBadge.className = 'badge ' + (support ? 'ok' : 'err');
+
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const btnInvert = document.getElementById('btnInvert');
+  const portName = document.getElementById('portName');
+  const statusEl = document.getElementById('status');
+  const vCount = document.getElementById('vCount');
+  const vRevs  = document.getElementById('vRevs');
+  const vAngle = document.getElementById('vAngle');
+  const vRate  = document.getElementById('vRate');
+
+  const dial = document.getElementById('dial');
+  const ctx  = dial.getContext('2d');
+
+  let port, reader, keepReading = false;
+  let frames = 0, lastRatePrint = 0;
+  let invert = false;  // invert flag
+
+  function setStatus(msg, cls=''){ statusEl.textContent = msg; statusEl.className = 'status ' + cls; }
+
+  function drawDial(angleDeg){
+    const w = dial.width, h = dial.height;
+    const cx = w/2, cy = h/2, r = Math.min(w,h)*0.42;
+
+    ctx.clearRect(0,0,w,h);
+
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.lineWidth = 16;
+    ctx.strokeStyle = '#223046';
+    ctx.stroke();
+
+    // Ticks every 30°
+    ctx.save();
+    ctx.translate(cx, cy);
+    for(let a=0; a<360; a+=30){
+      ctx.save();
+      ctx.rotate(a*Math.PI/180);
+      ctx.beginPath();
+      ctx.moveTo(0, -r+6);
+      ctx.lineTo(0, -r+26);
+      ctx.lineWidth = (a % 90 === 0) ? 4 : 2;
+      ctx.strokeStyle = '#3b4e6a';
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // Apply invert if active
+    let displayAngle = invert ? (360 - angleDeg) : angleDeg;
+
+    // Needle
+    const ang = (displayAngle-90) * Math.PI/180; // 0° at top
+    const nx = cx + Math.cos(ang)*(r-28);
+    const ny = cy + Math.sin(ang)*(r-28);
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(nx, ny);
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = '#00e5ff';
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, 12, 0, Math.PI*2);
+    ctx.fillStyle = '#00e5ff';
+    ctx.fill();
+
+    ctx.font = '700 28px Helvetica, Arial, sans-serif';
+    ctx.fillStyle = '#eaf6ff';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${displayAngle.toFixed(2)}°`, cx, cy + r + 36);
+  }
+
+  drawDial(0);
+
+  async function connect(){
+    if (!support) { setStatus('Web Serial not supported by this browser.', 'err'); return; }
+    try{
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+
+      portName.textContent = (port.getInfo && JSON.stringify(port.getInfo())) || 'Connected';
+      btnConnect.disabled = true;
+      btnDisconnect.disabled = false;
+      setStatus('Connected. Waiting for CSV…', 'ok');
+
+      const textDecoder = new TextDecoderStream();
+      port.readable.pipeTo(textDecoder.writable);
+      reader = textDecoder.readable.getReader();
+
+      keepReading = true;
+      readLoop();
+    }catch(err){
+      setStatus('Connection failed: ' + err.message, 'err');
+    }
+  }
+
+  async function disconnect(){
+    keepReading = false;
+    try{
+      if (reader){ await reader.cancel(); reader.releaseLock(); }
+      if (port){ await port.close(); }
+    }catch(e){}
+    reader = null; port = null;
+    btnConnect.disabled = false;
+    btnDisconnect.disabled = true;
+    portName.textContent = '—';
+    setStatus('Disconnected.', '');
+  }
+
+  async function readLoop(){
+    let buffer = '';
+    frames = 0;
+    lastRatePrint = performance.now();
+
+    while(keepReading){
+      try{
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value){
+          buffer += value;
+          let idx;
+          while((idx = buffer.indexOf('\n')) >= 0){
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx+1);
+            if (!line || line.startsWith('#')) continue;
+            processCSV(line);
+          }
+        }
+      }catch(err){
+        setStatus('Read error: ' + err.message, 'err');
+        break;
+      }
+    }
+  }
+
+  function processCSV(line){
+    const parts = line.split(',');
+    if (parts.length < 3) return;
+
+    const count = Number(parts[0]);
+    const revs  = Number(parts[1]);
+    const angle = Number(parts[2]);
+
+    if (!Number.isFinite(count) || !Number.isFinite(revs) || !Number.isFinite(angle)) return;
+
+    vCount.textContent = String(count);
+    vRevs.textContent  = String(revs);
+    vAngle.textContent = angle.toFixed(3);
+
+    drawDial((angle % 360 + 360) % 360);
+
+    frames++;
+    const now = performance.now();
+    if (now - lastRatePrint > 1000){
+      vRate.textContent = (frames / ((now - lastRatePrint)/1000)).toFixed(1) + ' Hz';
+      frames = 0;
+      lastRatePrint = now;
+    }
+  }
+
+  btnConnect.addEventListener('click', connect);
+  btnDisconnect.addEventListener('click', disconnect);
+  btnInvert.addEventListener('click', () => {
+    invert = !invert;
+    btnInvert.textContent = invert ? "Invert (ON)" : "Invert";
+  });
+})();
+</script>
+</body>
+</html>
