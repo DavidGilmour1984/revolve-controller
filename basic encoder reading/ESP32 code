@@ -1,0 +1,112 @@
+/*
+  ESP32 + Incremental Encoder (no homing, Z ignored)
+  Pins:
+    A (black)  -> GPIO12  (internal pull-up)
+    B (white)  -> GPIO13  (internal pull-up)
+    Z (orange) -> GPIO14  (ignored)
+  Power:
+    Brown -> +5..24V, Blue -> GND, Shield -> GND
+
+  CSV @ 20 Hz:
+    count,revs,angle_deg
+
+  Notes:
+    - No Z alignment. Angle is purely (count mod CPR) mapped to 0..360.
+    - Position is persisted across power cycles (assuming no movement while off).
+*/
+
+#include <Preferences.h>
+
+// ======== USER SETTINGS ========
+static constexpr int PIN_A = 12;   // A channel
+static constexpr int PIN_B = 13;   // B channel
+static constexpr int PIN_Z = 14;   // Z channel (wired OK, but ignored)
+
+static constexpr long PPR = 1000;  // <-- Set to your encoder PPR (e.g., 360/600/1000)
+static constexpr uint32_t PRINT_HZ = 20;        // 20 Hz CSV
+static constexpr uint32_t SAVE_PERIOD_MS = 100; // throttle NVS writes
+// =================================
+
+static constexpr long CPR = 4L * PPR;   // counts per rev (X4)
+volatile long encCount = 0;
+volatile uint8_t prevAB = 0;
+
+Preferences prefs;
+long lastSaved = 0;
+uint32_t lastSaveMs = 0;
+
+// Quadrature transition table: {-1,0,+1}; invalid transitions -> 0
+const int8_t qtable[4][4] = {
+/* prev 00 */ {  0, +1, -1,  0 },
+/* prev 01 */ { -1,  0,  0, +1 },
+/* prev 10 */ { +1,  0,  0, -1 },
+/* prev 11 */ {  0, -1, +1,  0 }
+};
+
+IRAM_ATTR void isrAB() {
+  const uint8_t a = (uint8_t)digitalRead(PIN_A);
+  const uint8_t b = (uint8_t)digitalRead(PIN_B);
+  const uint8_t curr = (a << 1) | b;
+  encCount += qtable[prevAB][curr];
+  prevAB = curr;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+  pinMode(PIN_Z, INPUT_PULLUP); // harmless; Z is ignored in logic
+
+  // Initialize previous AB state before enabling interrupts
+  prevAB = (digitalRead(PIN_A) << 1) | digitalRead(PIN_B);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_A), isrAB, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_B), isrAB, CHANGE);
+
+  // Restore last count from NVS
+  prefs.begin("encoder", false);
+  const long stored = prefs.getLong("count", 0);
+
+  noInterrupts();
+  encCount = stored;
+  interrupts();
+
+  lastSaved  = stored;
+  lastSaveMs = millis();
+
+  Serial.println("# count,revs,angle_deg");
+}
+
+void loop() {
+  static uint32_t lastPrint = 0;
+  const uint32_t now = millis();
+
+  long snapCount;
+  noInterrupts();
+  snapCount = encCount;
+  interrupts();
+
+  // Throttled save to NVS when the value changes
+  if ((snapCount != lastSaved) && (now - lastSaveMs) >= SAVE_PERIOD_MS) {
+    prefs.putLong("count", snapCount);
+    lastSaved = snapCount;
+    lastSaveMs = now;
+  }
+
+  // 20 Hz CSV output
+  if (now - lastPrint >= (1000 / PRINT_HZ)) {
+    lastPrint = now;
+
+    // floor division for revs
+    const long revs = (snapCount >= 0) ? (snapCount / CPR) : ((snapCount - (CPR - 1)) / CPR);
+
+    long mod = snapCount % CPR;
+    if (mod < 0) mod += CPR;
+    const float angle_deg = (360.0f * (float)mod) / (float)CPR;
+
+    // CSV: count,revs,angle_deg
+    Serial.printf("%ld,%ld,%.3f\n", snapCount, revs, angle_deg);
+  }
+}
